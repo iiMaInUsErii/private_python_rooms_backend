@@ -1,24 +1,29 @@
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
+from flask import Flask, request, jsonify
+from flask_cors import CORS  # Убедитесь, что импортировали CORS
 import sqlite3
 import time
 from contextlib import closing
-from typing import Optional, Dict, Any, List, Tuple
+import os
+import hashlib
 
 app = Flask(__name__)
-app.secret_key = b'fw!pk4[2f4%#g&bh".<t'  # В продакшене используйте переменные окружения
-app.config['CORS_HEADERS'] = 'Content-Type'
-CORS(app)
+app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key')
 
-# Конфигурация БД
-DATABASE = 'db.db'
+# Исправленная конфигурация CORS
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
-def get_db() -> sqlite3.Connection:
-    """Возвращает соединение с базой данных."""
+DATABASE = 'chat.db'
+
+def get_db():
     return sqlite3.connect(DATABASE, check_same_thread=False)
 
 def init_db():
-    """Инициализирует таблицы базы данных."""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS rooms (
@@ -26,141 +31,145 @@ def init_db():
             name TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL
         )''')
-
+        
         cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room TEXT NOT NULL,
-            name TEXT NOT NULL,
+            room_id INTEGER NOT NULL,
+            user_name TEXT NOT NULL,
             text TEXT NOT NULL,
-            time INTEGER NOT NULL,
-            read INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (room) REFERENCES rooms(name)
+            timestamp INTEGER NOT NULL,
+            FOREIGN KEY (room_id) REFERENCES rooms(id)
         )''')
         conn.commit()
 
-# Инициализация БД при старте
 init_db()
 
-# Вспомогательные функции
-def get_session_data() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Извлекает данные пользователя из сессии или запроса."""
-    name = request.json.get('name', session.get('name'))
-    room = request.json.get('room', session.get('room'))
-    password = request.json.get('password', session.get('password'))
-    return name, room, password
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-def validate_room(room: str, password: str) -> bool:
-    """Проверяет, существует ли комната и верный ли пароль."""
-    with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT password FROM rooms WHERE name = ?", (room,))
-        result = cursor.fetchone()
-        return result is not None and result[0] == password
+@app.after_request
+def add_cors_headers(response):
+    if request.path.startswith('/api/'):
+        response.headers.add('Access-Control-Allow-Origin', 'http://localhost:5173')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
-# Роуты
-@app.route("/")
-def index():
-    """Проверка работоспособности сервера."""
-    return jsonify(message='Server working')
-
-@app.route("/chat", methods=['POST', 'GET'])
-def chat():
-    """Обработчик чат-комнаты."""
-    name, room, password = get_session_data()
+@app.route("/api/check_room", methods=['POST'])
+def check_room():
+    data = request.json
+    room_name = data.get('room')
+    password = data.get('password')
     
-    if not all([name, room, password]):
-        return jsonify(error='Missing required parameters'), 400
+    if not room_name or not password:
+        return jsonify(error='Room name and password required'), 400
 
     with closing(get_db()) as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT id, password FROM rooms WHERE name = ?", (room_name,))
+        room = cursor.fetchone()
         
-        # Создание комнаты, если не существует
-        cursor.execute("SELECT COUNT(*) FROM rooms WHERE name = ?", (room,))
-        if cursor.fetchone()[0] < 1:
-            cursor.execute("INSERT INTO rooms (name, password) VALUES (?, ?)", (room, password))
-            conn.commit()
+        if room:
+            room_id, hashed_pw = room
+            if hashed_pw == hash_password(password):
+                return jsonify(exists=True, room_id=room_id)
+            return jsonify(exists=True, error='Invalid password'), 401
+        return jsonify(exists=False)
 
-        # Проверка пароля и получение сообщений
-        if not validate_room(room, password):
-            return jsonify(error='Invalid password'), 403
-
-        cursor.execute("SELECT * FROM messages WHERE room = ? ORDER BY time", (room,))
-        messages = cursor.fetchall()
-
-    # Сохранение данных в сессии
-    session.update(name=name, room=room, password=password)
+@app.route("/api/create_room", methods=['POST'])
+def create_room():
+    data = request.json
+    room_name = data.get('room')
+    password = data.get('password')
     
-    return jsonify(
-        name=name,
-        messages=messages,
-        room=room
-    )
+    if not room_name or not password:
+        return jsonify(error='Room name and password required'), 400
 
-@app.route('/new', methods=['POST'])
-def add_message():
-    """Добавление нового сообщения."""
-    required_fields = ['room', 'name', 'password', 'text']
-    if not all(field in request.json for field in required_fields):
+    hashed_pw = hash_password(password)
+    
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO rooms (name, password) VALUES (?, ?)",
+                (room_name, hashed_pw)
+            )
+            room_id = cursor.lastrowid
+            conn.commit()
+        return jsonify(success=True, room_id=room_id)
+    except sqlite3.IntegrityError:
+        return jsonify(error='Room already exists'), 409
+
+@app.route("/api/messages", methods=['GET'])
+def get_messages():
+    room_id = request.args.get('room_id')
+    if not room_id:
+        return jsonify(error='Room ID required'), 400
+
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, user_name, text, timestamp FROM messages WHERE room_id = ? ORDER BY timestamp ASC",
+                (room_id,)
+            )
+            messages = [
+                {
+                    'id': row[0],
+                    'user': row[1],
+                    'text': row[2],
+                    'time': row[3]
+                } for row in cursor.fetchall()
+            ]
+        return jsonify(messages=messages)
+    except sqlite3.Error:
+        return jsonify(error='Database error'), 500
+
+@app.route("/api/send_message", methods=['POST'])
+def send_message():
+    data = request.json
+    room_id = data.get('room_id')
+    user_name = data.get('user')
+    text = data.get('text')
+    
+    if not all([room_id, user_name, text]):
         return jsonify(error='Missing required fields'), 400
 
-    room, name, password, text = (request.json[f] for f in required_fields)
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO messages (room_id, user_name, text, timestamp) VALUES (?, ?, ?, ?)",
+                (room_id, user_name, text, int(time.time()))
+            )
+            conn.commit()
+        return jsonify(success=True, message_id=cursor.lastrowid)
+    except sqlite3.Error:
+        return jsonify(error='Failed to send message'), 500
 
-    if not validate_room(room, password):
-        return jsonify(error='Invalid password'), 403
-
-    with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO messages (room, name, text, time) VALUES (?, ?, ?, ?)",
-            (room, name, text, int(time.time()))
-        )
-        conn.commit()
-
-    return jsonify(status='success')
-
-@app.route('/delete', methods=['POST'])
+@app.route("/api/delete_message", methods=['POST'])
 def delete_message():
-    """Удаление сообщения."""
-    required_fields = ['room', 'name', 'password', 'id']
-    if not all(field in request.json for field in required_fields):
+    data = request.json
+    message_id = data.get('message_id')
+    user_name = data.get('user')
+    
+    if not message_id or not user_name:
         return jsonify(error='Missing required fields'), 400
 
-    room, name, password, msg_id = (request.json[f] for f in required_fields)
-
-    if not validate_room(room, password):
-        return jsonify(error='Invalid password'), 403
-
-    with closing(get_db()) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM messages WHERE id = ? AND name = ?",
-            (msg_id, name)
-        )
-        conn.commit()
-
-    return jsonify(status='success')
-
-@app.route('/logout')
-def logout():
-    """Выход из системы (очистка сессии)."""
-    session.clear()
-    return jsonify(status='logged out')
-
-# Внимание: этот роут опасен в продакшене!
-@app.route('/admin', methods=['GET'])
-def admin_panel():
-    """Админ-панель (только для демонстрации!)."""
-    if 'command' in request.args:
-        try:
-            with closing(get_db()) as conn:
-                cursor = conn.cursor()
-                cursor.execute(request.args['command'])
-                output = cursor.fetchall()
-        except sqlite3.Error as e:
-            output = [f"Error: {str(e)}"]
-    else:
-        output = []
-    return jsonify(output=output)  # В продакшене используйте шаблоны с авторизацией
+    try:
+        with closing(get_db()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM messages WHERE id = ? AND user_name = ?",
+                (message_id, user_name)
+            )
+            if cursor.rowcount == 0:
+                return jsonify(error='Message not found or not authorized'), 404
+            conn.commit()
+        return jsonify(success=True)
+    except sqlite3.Error:
+        return jsonify(error='Database error'), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=3000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
